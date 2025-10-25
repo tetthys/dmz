@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ===========================================================
-# DMZ Stack Provisioner (v2) - detailed logging & fixes
+# DMZ Stack Provisioner (v2.1) - detailed logging & heredoc fix
 # - Creates two KVM VMs from Ubuntu cloud image:
 #     * web-vm on br-external (DMZ)
 #     * internal-vm on br-internal (Internal)
@@ -12,15 +12,12 @@
 set -Eeuo pipefail
 
 ### ----- CONFIGURABLE VARS (EDIT ME) -----
-# Bridges prepared by host_setup.sh
 BR_EXTERNAL="br-external"
 BR_INTERNAL="br-internal"
 
-# Host bridge (gateway) IPs from host_setup.sh
 HOST_DMZ_GW="192.0.2.1"
 HOST_INT_GW="10.10.0.1"
 
-# VM static addresses (must align with nftables rules)
 WEB_VM_NAME="web-vm"
 WEB_VM_IP="192.0.2.101"
 WEB_VM_CIDR="24"
@@ -29,17 +26,14 @@ INTERNAL_VM_NAME="internal-vm"
 INTERNAL_VM_IP="10.10.0.11"
 INTERNAL_VM_CIDR="24"
 
-# VirtIO NIC default name in Ubuntu cloud images is often "ens3"
-# If your image names it differently (e.g., enp1s0), change here.
+# Often "ens3" for Ubuntu cloud images
 GUEST_IFACE_NAME="ens3"
 
-# VM resources
 WEB_VM_MEM="4096"
 WEB_VM_CPUS="2"
 INTERNAL_VM_MEM="4096"
 INTERNAL_VM_CPUS="2"
 
-# Storage paths
 IMG_DIR="/var/lib/libvirt/images"
 CLOUD_IMG="${IMG_DIR}/ubuntu-22.04-server-cloudimg-amd64.img"
 CLOUD_IMG_URL="https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
@@ -51,22 +45,17 @@ SEED_DIR="/var/lib/libvirt/cloud-seed"
 WEB_SEED_ISO="${SEED_DIR}/${WEB_VM_NAME}-seed.iso"
 INT_SEED_ISO="${SEED_DIR}/${INTERNAL_VM_NAME}-seed.iso"
 
-# Internal API port allowed DMZ->Internal
 INTERNAL_API_PORT="8443"
 
-# Inject your SSH public key (required)
-# Example: SSH_PUBLIC_KEY="$(cat ~/.ssh/id_ed25519.pub)"
+# REQUIRED: put your SSH pubkey
 SSH_PUBLIC_KEY="REPLACE_WITH_YOUR_SSH_PUBLIC_KEY"
 
-# Timezone for both VMs
 TIMEZONE="Asia/Seoul"
 
-# Logging & verbosity
 LOG_FILE="$(pwd)/provision.log"
-VERBOSE="${VERBOSE:-1}"   # set to 0 for quieter run
-WAIT_SSH="${WAIT_SSH:-1}" # wait for SSH port after boot (0 to skip)
-SSH_TIMEOUT_SEC=180       # max time to wait for SSH to open
-
+VERBOSE="${VERBOSE:-1}"   # set 0 for quieter
+WAIT_SSH="${WAIT_SSH:-1}" # 0 to skip
+SSH_TIMEOUT_SEC=180
 ### ----- END CONFIG -----
 
 # ====== Logging helpers ======
@@ -76,24 +65,21 @@ dbg() { [[ "$VERBOSE" = "1" ]] && log "[DEBUG] $*"; true; }
 err() { echo "[$(ts)] [ERROR] $*" | tee -a "$LOG_FILE" >&2; }
 
 trap 'rc=$?; err "Failed at line $LINENO (exit $rc). See $LOG_FILE for details."; exit $rc' ERR
-
 [[ "$VERBOSE" = "1" ]] && set -x
 
 # ====== Preflight ======
 need() { command -v "$1" >/dev/null 2>&1 || { err "Missing command: $1"; exit 1; }; }
 
-log "===== DMZ Provisioner v2 starting ====="
 : > "$LOG_FILE" || true
+log "===== DMZ Provisioner v2.1 starting ====="
 
 log "[1/8] Preflight checks..."
 for bin in wget qemu-img virt-install cloud-localds virsh; do need "$bin"; done
 
-# Check bridges exist (created by host_setup.sh)
 ip link show "$BR_EXTERNAL" >/dev/null 2>&1 || { err "Bridge $BR_EXTERNAL not found. Run host_setup.sh first."; exit 1; }
 ip link show "$BR_INTERNAL" >/dev/null 2>&1 || { err "Bridge $BR_INTERNAL not found. Run host_setup.sh first."; exit 1; }
 log "Bridges OK: $BR_EXTERNAL, $BR_INTERNAL"
 
-# Validate SSH key
 if [[ "$SSH_PUBLIC_KEY" == "REPLACE_WITH_YOUR_SSH_PUBLIC_KEY" ]]; then
   err "SSH_PUBLIC_KEY is not set. Paste your public key into the script."
   exit 1
@@ -109,16 +95,14 @@ else
   log "Cloud image already present. Skipping download."
 fi
 
-# ====== Create VM disks (qcow2 with backing, format specified) ======
+# ====== Create VM disks ======
 log "[3/8] Preparing VM disks..."
 if [[ ! -f "$WEB_DISK" ]]; then
-  # -F qcow2 explicitly states the backing file format (prevents warnings)
   qemu-img create -f qcow2 -F qcow2 -b "$CLOUD_IMG" "$WEB_DISK" | tee -a "$LOG_FILE"
   log "Created $WEB_DISK"
 else
   log "Found existing $WEB_DISK (reusing)."
 fi
-
 if [[ ! -f "$INT_DISK" ]]; then
   qemu-img create -f qcow2 -F qcow2 -b "$CLOUD_IMG" "$INT_DISK" | tee -a "$LOG_FILE"
   log "Created $INT_DISK"
@@ -130,8 +114,8 @@ fi
 log "[4/8] Generating cloud-init seed ISOs in $SEED_DIR ..."
 mkdir -p "$SEED_DIR"
 
-# Compose files (inline)
-read -r -d '' WEB_COMPOSE <<'YML'
+# Compose / seccomp content via heredoc (no read -d '')
+WEB_COMPOSE=$(cat <<'YML'
 version: '3.8'
 services:
   web:
@@ -147,8 +131,9 @@ services:
       - INTERNAL_API_URL=https://10.10.0.11:8443
     ports: ["443:443"]
 YML
+)
 
-read -r -d '' WEB_SECCOMP <<'JSON'
+WEB_SECCOMP=$(cat <<'JSON'
 {
   "defaultAction": "SCMP_ACT_ERRNO",
   "syscalls": [
@@ -159,8 +144,9 @@ read -r -d '' WEB_SECCOMP <<'JSON'
   ]
 }
 JSON
+)
 
-read -r -d '' INT_COMPOSE <<'YML'
+INT_COMPOSE=$(cat <<'YML'
 version: '3.8'
 services:
   vault-agent:
@@ -175,8 +161,9 @@ services:
       - DB_DSN=postgresql://app:password@10.10.0.21:5432/appdb
     tmpfs: ["/run/secrets"]
 YML
+)
 
-# user-data/meta-data generators
+# Generators
 make_user_data() {
   local vm="$1" ip="$2" cidr="$3" gw="$4" is_web="$5"
   local outf="${SEED_DIR}/${vm}-user-data.yaml"
@@ -201,24 +188,28 @@ write_files:
             nameservers: { addresses: [1.1.1.1,8.8.8.8] }
 EOF
     if [[ "$is_web" == "yes" ]]; then
-      # web compose + seccomp
-      echo "  - path: /home/ubuntu/docker-compose.yml"
-      echo "    permissions: '0644'"
-      echo "    content: |"
+      cat <<'EOS'
+  - path: /home/ubuntu/docker-compose.yml
+    permissions: '0644'
+    content: |
+EOS
       echo "$WEB_COMPOSE" | sed 's/^/      /'
-      echo "  - path: /home/ubuntu/web_seccomp.json"
-      echo "    permissions: '0644'"
-      echo "    content: |"
+      cat <<'EOS'
+  - path: /home/ubuntu/web_seccomp.json
+    permissions: '0644'
+    content: |
+EOS
       echo "$WEB_SECCOMP" | sed 's/^/      /'
     else
-      # internal compose + minimal vault agent config placeholder
-      echo "  - path: /home/ubuntu/docker-compose.yml"
-      echo "    permissions: '0644'"
-      echo "    content: |"
+      cat <<'EOS'
+  - path: /home/ubuntu/docker-compose.yml
+    permissions: '0644'
+    content: |
+EOS
       echo "$INT_COMPOSE" | sed 's/^/      /'
-      echo "  - path: /home/ubuntu/vault-config/agent.hcl"
-      echo "    permissions: '0644'"
-      cat <<'EOF2'
+      cat <<'EOS'
+  - path: /home/ubuntu/vault-config/agent.hcl
+    permissions: '0644'
     content: |
       auto_auth {
         method "approle" {
@@ -238,7 +229,7 @@ EOF
         address = "127.0.0.1:8200"
         tls_disable = 1
       }
-EOF2
+EOS
     fi
     cat <<'EOF3'
 runcmd:
@@ -266,12 +257,11 @@ make_meta_data "$WEB_VM_NAME"
 make_user_data "$INTERNAL_VM_NAME" "$INTERNAL_VM_IP" "$INTERNAL_VM_CIDR" "$HOST_INT_GW" "no"
 make_meta_data "$INTERNAL_VM_NAME"
 
-# Build seed ISOs
 cloud-localds "$WEB_SEED_ISO" "${SEED_DIR}/${WEB_VM_NAME}-user-data.yaml" "${SEED_DIR}/${WEB_VM_NAME}-meta-data.yaml" | tee -a "$LOG_FILE"
 cloud-localds "$INT_SEED_ISO" "${SEED_DIR}/${INTERNAL_VM_NAME}-user-data.yaml" "${SEED_DIR}/${INTERNAL_VM_NAME}-meta-data.yaml" | tee -a "$LOG_FILE"
 log "Seed ISOs ready: $WEB_SEED_ISO , $INT_SEED_ISO"
 
-# ====== Boot VMs (idempotent clean) ======
+# ====== Boot VMs ======
 log "[5/8] Defining/booting VMs with virt-install --import ..."
 if virsh dominfo "$WEB_VM_NAME" >/dev/null 2>&1; then
   log "Cleaning existing domain: $WEB_VM_NAME"
