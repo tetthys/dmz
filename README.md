@@ -9,5 +9,5 @@ sudo bash host_setup.sh
 ```
 
 ```
-sudo bash provision_dmv_stack.sh
+sudo VERBOSE=1 WAIT_SSH=0 DEBUG_CLOUDINIT=1 bash provision_dmv_stack.sh all
 ```
