@@ -159,15 +159,16 @@ mkdir -p "$SEED_DIR"
 # Compose stacks (security posture for containers):
 #   - web: non-root, read-only FS, seccomp; env points to Internal API (mTLS can be added later).
 #   - internal: placeholder vault-agent + internal-service (DB/HSM wiring to be filled in your env).
+# Compose / seccomp content via heredoc (no read -d '')
 WEB_COMPOSE=$(cat <<'YML'
 version: '3.8'
 services:
   web:
     image: your-org/your-web-app:latest
-    user: "1000:1000"          # drop root in container: reduce blast radius
-    read_only: true            # immutable root FS: hinders persistence
-    tmpfs: ["/tmp"]            # writeable temp only; disappears on restart
-    cap_drop: ["ALL"]          # remove Linux caps: no unintended syscalls
+    user: "1000:1000"
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
     security_opt:
       - no-new-privileges:true
       - seccomp:/home/ubuntu/web_seccomp.json
@@ -177,8 +178,7 @@ services:
 YML
 )
 
-# Minimal seccomp profile (allow-list style).
-WEB_SECCOMP($(cat <<'JSON'
+WEB_SECCOMP=$(cat <<'JSON'
 {
   "defaultAction": "SCMP_ACT_ERRNO",
   "syscalls": [
@@ -189,9 +189,8 @@ WEB_SECCOMP($(cat <<'JSON'
   ]
 }
 JSON
-) )
+)
 
-# Internal service stack — secrets agent + app (fill in Vault/HSM in your environment).
 INT_COMPOSE=$(cat <<'YML'
 version: '3.8'
 services:
