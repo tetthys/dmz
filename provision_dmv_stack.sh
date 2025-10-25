@@ -1,69 +1,95 @@
 #!/usr/bin/env bash
-# ===========================================================
-# DMZ Stack Provisioner (v2.1) - detailed logging & heredoc fix
-# - Creates two KVM VMs from Ubuntu cloud image:
-#     * web-vm on br-external (DMZ)
-#     * internal-vm on br-internal (Internal)
-# - Each VM auto-installs docker & docker compose via cloud-init,
-#   writes compose files, and runs `docker compose up -d`.
-# - Idempotent: safe to re-run if interrupted mid-way.
-# ===========================================================
+# ===================================================================================
+# DMZ Stack Provisioner (v2.2) — Hardened with detailed rationale
+# -----------------------------------------------------------------------------------
+# Purpose:
+#   Provision two KVM VMs from an Ubuntu cloud image to realize a DMZ architecture:
+#     - web-vm      → attached to br-external (DMZ segment)
+#     - internal-vm → attached to br-internal (Internal segment)
+#
+# Security model (what this helps protect):
+#   - The web tier is assumed breachable (RCE/webshell). We constrain damage by:
+#       * Strict network segmentation at L2 (two bridges) and L3 (host as gateway).
+#       * Cloud-init enforces static IPs and bootstraps only minimal packages.
+#       * Containers run with least privilege (non-root, read-only FS, seccomp).
+#       * The web tier talks only to a single internal API (mTLS-ready later),
+#         and only to a pinned external endpoint (Bank API) via host nft rules.
+#   - Result: Even if web-vm is compromised, it cannot move laterally into Internal
+#     except a single port/host, nor exfiltrate to arbitrary destinations.
+#
+# Why cloud-init?
+#   - Unattended, idempotent, auditable VM bootstrap (infra-as-code).
+#   - Precise netplan (static IP/gateway), package set, and files (compose/SECComp).
+#
+# Idempotency notes:
+#   - Re-running will reuse cloud image, disks, and seed ISOs if present.
+#   - Existing libvirt domains are destroyed/undefined before import-boot.
+# ===================================================================================
 
 set -Eeuo pipefail
 
-# Load .env if present (export all vars)
+# (silent) load environment overrides if present
 if [ -f ".env" ]; then
   set -a; . ./.env; set +a
 fi
 
-### ----- CONFIGURABLE VARS (EDIT ME) -----
-BR_EXTERNAL="br-external"
-BR_INTERNAL="br-internal"
+# ==============================
+# CONFIGURABLE VARIABLES (edit)
+# ==============================
+BR_EXTERNAL="${BR_EXTERNAL:-br-external}"     # DMZ L2
+BR_INTERNAL="${BR_INTERNAL:-br-internal}"     # Internal L2
 
-HOST_DMZ_GW="192.0.2.1"
-HOST_INT_GW="10.10.0.1"
+HOST_DMZ_GW="${HOST_DMZ_GW:-192.0.2.1}"      # Host-side GW on br-external
+HOST_INT_GW="${HOST_INT_GW:-10.10.0.1}"      # Host-side GW on br-internal
 
-WEB_VM_NAME="web-vm"
-WEB_VM_IP="192.0.2.101"
-WEB_VM_CIDR="24"
+WEB_VM_NAME="${WEB_VM_NAME:-web-vm}"
+WEB_VM_IP="${WEB_VM_IP:-192.0.2.101}"
+WEB_VM_CIDR="${WEB_VM_CIDR:-24}"
 
-INTERNAL_VM_NAME="internal-vm"
-INTERNAL_VM_IP="10.10.0.11"
-INTERNAL_VM_CIDR="24"
+INTERNAL_VM_NAME="${INTERNAL_VM_NAME:-internal-vm}"
+INTERNAL_VM_IP="${INTERNAL_VM_IP:-10.10.0.11}"
+INTERNAL_VM_CIDR="${INTERNAL_VM_CIDR:-24}"
 
-# Often "ens3" for Ubuntu cloud images
-GUEST_IFACE_NAME="ens3"
+# NIC name inside the guest image (Ubuntu cloud images commonly use "ens3").
+# Adjust if your image enumerates a different interface name.
+GUEST_IFACE_NAME="${GUEST_IFACE_NAME:-ens3}"
 
-WEB_VM_MEM="4096"
-WEB_VM_CPUS="2"
-INTERNAL_VM_MEM="4096"
-INTERNAL_VM_CPUS="2"
+# VM resources — tune to workload (bigger ≠ safer; least privilege for resources too).
+WEB_VM_MEM="${WEB_VM_MEM:-4096}"
+WEB_VM_CPUS="${WEB_VM_CPUS:-2}"
+INTERNAL_VM_MEM="${INTERNAL_VM_MEM:-4096}"
+INTERNAL_VM_CPUS="${INTERNAL_VM_CPUS:-2}"
 
-IMG_DIR="/var/lib/libvirt/images"
-CLOUD_IMG="${IMG_DIR}/ubuntu-22.04-server-cloudimg-amd64.img"
-CLOUD_IMG_URL="https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
+# Storage layout for images and cloud-init seed ISOs.
+IMG_DIR="${IMG_DIR:-/var/lib/libvirt/images}"
+CLOUD_IMG="${CLOUD_IMG:-${IMG_DIR}/ubuntu-22.04-server-cloudimg-amd64.img}"
+CLOUD_IMG_URL="${CLOUD_IMG_URL:-https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img}"
 
-WEB_DISK="${IMG_DIR}/${WEB_VM_NAME}.qcow2"
-INT_DISK="${IMG_DIR}/${INTERNAL_VM_NAME}.qcow2"
+WEB_DISK="${WEB_DISK:-${IMG_DIR}/${WEB_VM_NAME}.qcow2}"
+INT_DISK="${INT_DISK:-${IMG_DIR}/${INTERNAL_VM_NAME}.qcow2}"
 
-SEED_DIR="/var/lib/libvirt/cloud-seed"
-WEB_SEED_ISO="${SEED_DIR}/${WEB_VM_NAME}-seed.iso"
-INT_SEED_ISO="${SEED_DIR}/${INTERNAL_VM_NAME}-seed.iso"
+SEED_DIR="${SEED_DIR:-/var/lib/libvirt/cloud-seed}"
+WEB_SEED_ISO="${WEB_SEED_ISO:-${SEED_DIR}/${WEB_VM_NAME}-seed.iso}"
+INT_SEED_ISO="${INT_SEED_ISO:-${SEED_DIR}/${INTERNAL_VM_NAME}-seed.iso}"
 
-INTERNAL_API_PORT="8443"
+# The single internal API port exposed to DMZ (host nft rules should match this).
+INTERNAL_API_PORT="${INTERNAL_API_PORT:-8443}"
 
-# REQUIRED: put your SSH pubkey
-SSH_PUBLIC_KEY="REPLACE_WITH_YOUR_SSH_PUBLIC_KEY"
+# SSH key injected into both VMs for administrative access (cloud-init).
+SSH_PUBLIC_KEY="${SSH_PUBLIC_KEY:-REPLACE_WITH_YOUR_SSH_PUBLIC_KEY}"
 
-TIMEZONE="Asia/Seoul"
+# System timezone for the guests.
+TIMEZONE="${TIMEZONE:-Asia/Seoul}"
 
-LOG_FILE="$(pwd)/provision.log"
-VERBOSE="${VERBOSE:-1}"   # set 0 for quieter
-WAIT_SSH="${WAIT_SSH:-1}" # 0 to skip
-SSH_TIMEOUT_SEC=180
-### ----- END CONFIG -----
+# Logging / behavior
+LOG_FILE="${LOG_FILE:-$(pwd)/provision.log}"
+VERBOSE="${VERBOSE:-1}"         # 1: echo commands (trace)  0: quieter
+WAIT_SSH="${WAIT_SSH:-1}"       # 1: wait for SSH after boot (safer)  0: skip (faster)
+SSH_TIMEOUT_SEC="${SSH_TIMEOUT_SEC:-180}"
 
-# ====== Logging helpers ======
+# ==============
+# LOG FUNCTIONS
+# ==============
 ts() { date +"%Y-%m-%d %H:%M:%S%z"; }
 log() { echo "[$(ts)] $*" | tee -a "$LOG_FILE"; }
 dbg() { [[ "$VERBOSE" = "1" ]] && log "[DEBUG] $*"; true; }
@@ -72,25 +98,31 @@ err() { echo "[$(ts)] [ERROR] $*" | tee -a "$LOG_FILE" >&2; }
 trap 'rc=$?; err "Failed at line $LINENO (exit $rc). See $LOG_FILE for details."; exit $rc' ERR
 [[ "$VERBOSE" = "1" ]] && set -x
 
-# ====== Preflight ======
+# ===========
+# PREFLIGHT
+# ===========
 need() { command -v "$1" >/dev/null 2>&1 || { err "Missing command: $1"; exit 1; }; }
 
 : > "$LOG_FILE" || true
-log "===== DMZ Provisioner v2.1 starting ====="
+log "===== DMZ Provisioner v2.2 starting ====="
 
 log "[1/8] Preflight checks..."
 for bin in wget qemu-img virt-install cloud-localds virsh; do need "$bin"; done
 
-ip link show "$BR_EXTERNAL" >/dev/null 2>&1 || { err "Bridge $BR_EXTERNAL not found. Run host_setup.sh first."; exit 1; }
-ip link show "$BR_INTERNAL" >/dev/null 2>&1 || { err "Bridge $BR_INTERNAL not found. Run host_setup.sh first."; exit 1; }
+# Bridges must already exist and be configured by host_setup.sh (policy lives on the host).
+ip link show "$BR_EXTERNAL" >/dev/null 2>&1 || { err "Bridge $BR_EXTERNAL not found (run host_setup.sh)."; exit 1; }
+ip link show "$BR_INTERNAL" >/dev/null 2>&1 || { err "Bridge $BR_INTERNAL not found (run host_setup.sh)."; exit 1; }
 log "Bridges OK: $BR_EXTERNAL, $BR_INTERNAL"
 
+# Fail fast if no SSH key — otherwise you lock yourself out.
 if [[ "$SSH_PUBLIC_KEY" == "REPLACE_WITH_YOUR_SSH_PUBLIC_KEY" ]]; then
-  err "SSH_PUBLIC_KEY is not set. Paste your public key into the script."
+  err "SSH_PUBLIC_KEY is not set. Paste your public key."
   exit 1
 fi
 
-# ====== Download cloud image ======
+# =========================
+# BASE CLOUD IMAGE (cache)
+# =========================
 log "[2/8] Ensuring base cloud image exists at $CLOUD_IMG ..."
 mkdir -p "$IMG_DIR"
 if [[ ! -f "$CLOUD_IMG" ]]; then
@@ -100,8 +132,11 @@ else
   log "Cloud image already present. Skipping download."
 fi
 
-# ====== Create VM disks ======
+# =======================
+# VM DISKS (QCOW2 COW)
+# =======================
 log "[3/8] Preparing VM disks..."
+# Use qcow2 with a backing file (the base cloud image). Explicit -F to avoid ambiguity.
 if [[ ! -f "$WEB_DISK" ]]; then
   qemu-img create -f qcow2 -F qcow2 -b "$CLOUD_IMG" "$WEB_DISK" | tee -a "$LOG_FILE"
   log "Created $WEB_DISK"
@@ -115,20 +150,24 @@ else
   log "Found existing $INT_DISK (reusing)."
 fi
 
-# ====== cloud-init seed generation ======
+# ======================================
+# CLOUD-INIT SEEDS (USER/META-DATA ISOs)
+# ======================================
 log "[4/8] Generating cloud-init seed ISOs in $SEED_DIR ..."
 mkdir -p "$SEED_DIR"
 
-# Compose / seccomp content via heredoc (no read -d '')
+# Compose stacks (security posture for containers):
+#   - web: non-root, read-only FS, seccomp; env points to Internal API (mTLS can be added later).
+#   - internal: placeholder vault-agent + internal-service (DB/HSM wiring to be filled in your env).
 WEB_COMPOSE=$(cat <<'YML'
 version: '3.8'
 services:
   web:
     image: your-org/your-web-app:latest
-    user: "1000:1000"
-    read_only: true
-    tmpfs: ["/tmp"]
-    cap_drop: ["ALL"]
+    user: "1000:1000"          # drop root in container: reduce blast radius
+    read_only: true            # immutable root FS: hinders persistence
+    tmpfs: ["/tmp"]            # writeable temp only; disappears on restart
+    cap_drop: ["ALL"]          # remove Linux caps: no unintended syscalls
     security_opt:
       - no-new-privileges:true
       - seccomp:/home/ubuntu/web_seccomp.json
@@ -138,7 +177,8 @@ services:
 YML
 )
 
-WEB_SECCOMP=$(cat <<'JSON'
+# Minimal seccomp profile (allow-list style).
+WEB_SECCOMP($(cat <<'JSON'
 {
   "defaultAction": "SCMP_ACT_ERRNO",
   "syscalls": [
@@ -149,8 +189,9 @@ WEB_SECCOMP=$(cat <<'JSON'
   ]
 }
 JSON
-)
+) )
 
+# Internal service stack — secrets agent + app (fill in Vault/HSM in your environment).
 INT_COMPOSE=$(cat <<'YML'
 version: '3.8'
 services:
@@ -168,7 +209,7 @@ services:
 YML
 )
 
-# Generators
+# Build user-data with static netplan + docker install + compose files + first boot run.
 make_user_data() {
   local vm="$1" ip="$2" cidr="$3" gw="$4" is_web="$5"
   local outf="${SEED_DIR}/${vm}-user-data.yaml"
@@ -181,6 +222,7 @@ make_user_data() {
     echo "packages: [docker.io, docker-compose-plugin, net-tools]"
     cat <<EOF
 write_files:
+  # Enforce static IP/GW/DNS — cloud-init drives netplan so app policy matches host nft policy.
   - path: /etc/netplan/50-cloud-init.yaml
     permissions: '0644'
     content: |
@@ -216,6 +258,7 @@ EOS
   - path: /home/ubuntu/vault-config/agent.hcl
     permissions: '0644'
     content: |
+      # Placeholder Vault Agent config — wire your auth method and templates.
       auto_auth {
         method "approle" {
           config = {
@@ -237,6 +280,7 @@ EOS
 EOS
     fi
     cat <<'EOF3'
+# First boot actions — commit the minimal runtime and bring up services.
 runcmd:
   - [ bash, -lc, "netplan apply" ]
   - [ bash, -lc, "usermod -aG docker ubuntu" ]
@@ -247,6 +291,7 @@ EOF3
   dbg "Wrote $outf"
 }
 
+# Minimal meta-data: stable instance-id/hostname (helps cloud-init idempotency).
 make_meta_data() {
   local vm="$1"
   local outf="${SEED_DIR}/${vm}-meta-data.yaml"
@@ -266,8 +311,11 @@ cloud-localds "$WEB_SEED_ISO" "${SEED_DIR}/${WEB_VM_NAME}-user-data.yaml" "${SEE
 cloud-localds "$INT_SEED_ISO" "${SEED_DIR}/${INTERNAL_VM_NAME}-user-data.yaml" "${SEED_DIR}/${INTERNAL_VM_NAME}-meta-data.yaml" | tee -a "$LOG_FILE"
 log "Seed ISOs ready: $WEB_SEED_ISO , $INT_SEED_ISO"
 
-# ====== Boot VMs ======
+# ============================
+# DEFINE & BOOT LIBVIRT VMs
+# ============================
 log "[5/8] Defining/booting VMs with virt-install --import ..."
+# Clean any stale domains for deterministic re-runs.
 if virsh dominfo "$WEB_VM_NAME" >/dev/null 2>&1; then
   log "Cleaning existing domain: $WEB_VM_NAME"
   virsh destroy "$WEB_VM_NAME" >/dev/null 2>&1 || true
@@ -299,9 +347,11 @@ virt-install \
   --os-variant ubuntu22.04 \
   --noautoconsole | tee -a "$LOG_FILE"
 
-log "[6/8] VMs launched. (cloud-init will configure them on first boot)"
+log "[6/8] VMs launched. Cloud-init is applying configuration on first boot."
 
-# ====== Optional: wait for SSH ======
+# ===================
+# OPTIONAL: WAIT SSH
+# ===================
 wait_ssh() {
   local ip="$1" dur="$2"
   log "Waiting for SSH on $ip (timeout ${dur}s)..."
@@ -325,12 +375,15 @@ else
   log "[7/8] Skipping SSH wait (WAIT_SSH=0)."
 fi
 
+# =======
+# DONE
+# =======
 log "[8/8] Done."
 log "Next steps:"
 log " - SSH into web-vm:      ssh ubuntu@${WEB_VM_IP}"
 log " - SSH into internal-vm: ssh ubuntu@${INTERNAL_VM_IP}"
-log "Quick checks:"
-log " - On web-vm:     docker ps; curl -vk https://${INTERNAL_VM_IP}:${INTERNAL_API_PORT}"
-log " - On web-vm:     curl -vk https://8.8.8.8   # should be BLOCKED by host nft"
+log "Quick checks (align with host nft policy):"
+log " - On web-vm:     docker ps; curl -vk https://${INTERNAL_VM_IP}:${INTERNAL_API_PORT}   # allowed"
+log " - On web-vm:     curl -vk https://8.8.8.8                                       # blocked by host"
 log " - On internal-vm:docker ps"
-log "Full log written to: $LOG_FILE"
+log "Full log at: $LOG_FILE"
