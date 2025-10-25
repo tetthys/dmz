@@ -71,6 +71,8 @@ VERBOSE="${VERBOSE:-1}"
 WAIT_SSH="${WAIT_SSH:-1}"
 SSH_TIMEOUT_SEC="${SSH_TIMEOUT_SEC:-300}"
 
+EXT_IF="${EXT_IF:-eth0}"   # host external NIC used for NAT (e.g., eth0)
+
 # -----------------------------
 # Logging helpers & trap
 # -----------------------------
@@ -82,6 +84,41 @@ section(){ echo -e "\n========== $* ==========" | tee -a "$LOG_FILE"; }
 trap 'rc=$?; err "Failed at line $LINENO (exit $rc). See $LOG_FILE for details."; exit $rc' ERR
 
 need(){ command -v "$1" >/dev/null 2>&1 || { err "Missing command: $1"; exit 1; }; }
+
+# ----- helpers for temporary NAT rule (internal-vm) -----
+_get_internal_nat_handle() {
+  nft -a list chain ip dmz_nat postrouting 2>/dev/null \
+    | awk '/ip saddr 10\.10\.0\.11 .* oifname/ && /masquerade/ {print $NF; exit}'
+}
+
+_add_internal_nat_rule() {
+  # dmz_nat 테이블이 없으면 host_setup.sh 미적용 상태 — 안전하게 스킵
+  if ! nft list table ip dmz_nat >/dev/null 2>&1; then
+    err "dmz_nat table not found. Run host_setup.sh first."
+    return 0
+  fi
+  local h="$(_get_internal_nat_handle || true)"
+  if [[ -z "$h" ]]; then
+    nft add rule ip dmz_nat postrouting ip saddr 10.10.0.11 oifname "$EXT_IF" masquerade
+    log "Added temporary NAT for 10.10.0.11 via $EXT_IF (dmz_nat.postrouting)."
+  else
+    dbg "Temporary NAT for 10.10.0.11 already present (handle $h)."
+  fi
+}
+
+_remove_internal_nat_rule() {
+  if ! nft list table ip dmz_nat >/dev/null 2>&1; then
+    dbg "dmz_nat table not present, skip removing temporary NAT."
+    return 0
+  fi
+  local h="$(_get_internal_nat_handle || true)"
+  if [[ -n "$h" ]]; then
+    nft delete rule ip dmz_nat postrouting handle "$h"
+    log "Removed temporary NAT for 10.10.0.11 (handle $h)."
+  else
+    dbg "No temporary NAT handle found for 10.10.0.11 — nothing to remove."
+  fi
+}
 
 # -----------------------------
 # 1) Preflight
@@ -251,23 +288,45 @@ build_seeds() {
 # 7) Temporary egress (HTTP/HTTPS/DNS) – optional
 # -----------------------------
 enable_temp_egress() {
-  section "[4b] Enable temporary egress (HTTP/HTTPS/DNS) for web-vm"
+  section "[4b] Enable temporary egress (HTTP/HTTPS/DNS) for web+internal VMs"
+
+  # 1) 임시 필터 테이블 초기화
   nft list table inet dmz_prov >/dev/null 2>&1 && nft delete table inet dmz_prov || true
   nft add table inet dmz_prov
-  # set early priority (smaller = earlier) and default drop, then allow what we need
+  # 평가 순서 명확화: 낮은 우선순위(더 먼저 평가). 기본 DROP, 명시 허용만 통과
   nft add chain inet dmz_prov forward '{ type filter hook forward priority -150; policy drop; }'
   nft add rule  inet dmz_prov forward ct state established,related counter accept
-  nft add rule  inet dmz_prov forward ip saddr ${WEB_VM_IP} udp dport 53 counter accept
-  nft add rule  inet dmz_prov forward ip saddr ${WEB_VM_IP} tcp dport 53 counter accept
+
+  # 2) web-vm egress 허용 (DNS/HTTP/HTTPS)
+  nft add rule  inet dmz_prov forward ip saddr ${WEB_VM_IP} udp dport 53  counter accept
+  nft add rule  inet dmz_prov forward ip saddr ${WEB_VM_IP} tcp dport 53  counter accept
   nft add rule  inet dmz_prov forward ip saddr ${WEB_VM_IP} tcp dport 80  counter accept
   nft add rule  inet dmz_prov forward ip saddr ${WEB_VM_IP} tcp dport 443 counter accept
-  log "Temporary egress (53/udp,53/tcp,80,443) enabled."
+
+  # 3) internal-vm egress 허용 (DNS/HTTP/HTTPS) — apt 설치용
+  nft add rule  inet dmz_prov forward ip saddr ${INTERNAL_VM_IP} udp dport 53  counter accept
+  nft add rule  inet dmz_prov forward ip saddr ${INTERNAL_VM_IP} tcp dport 53  counter accept
+  nft add rule  inet dmz_prov forward ip saddr ${INTERNAL_VM_IP} tcp dport 80  counter accept
+  nft add rule  inet dmz_prov forward ip saddr ${INTERNAL_VM_IP} tcp dport 443 counter accept
+
+  log "Temporary egress allow-list enabled for ${WEB_VM_IP} and ${INTERNAL_VM_IP}."
+
+  # 4) internal-vm NAT 임시 추가 (외부 응답 경로 확보)
+  _add_internal_nat_rule
+
+  log "Temporary provisioning window is active. It will be auto-removed on timeout/signal."
 }
 
 disable_temp_egress() {
-  section "[6b] Disable temporary egress"
+  section "[6b] Disable temporary egress (and temporary internal NAT)"
+
+  # 1) 임시 NAT 제거 (internal-vm용)
+  _remove_internal_nat_rule
+
+  # 2) 임시 필터 테이블 제거
   nft list table inet dmz_prov >/dev/null 2>&1 && nft delete table inet dmz_prov || true
-  log "Temporary egress removed."
+
+  log "Temporary egress and temporary NAT are removed."
 }
 
 schedule_disable_egress() {
