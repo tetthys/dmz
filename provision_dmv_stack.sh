@@ -11,6 +11,11 @@
 
 set -Eeuo pipefail
 
+# Load .env if present (export all vars)
+if [ -f ".env" ]; then
+  set -a; . ./.env; set +a
+fi
+
 ### ----- CONFIGURABLE VARS (EDIT ME) -----
 BR_EXTERNAL="br-external"
 BR_INTERNAL="br-internal"

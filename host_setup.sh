@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Load .env if present (export all vars)
+if [ -f ".env" ]; then
+  set -a; . ./.env; set +a
+fi
+
 # -----------------------------------------------
 # DMZ Host Setup Script
 # -----------------------------------------------
